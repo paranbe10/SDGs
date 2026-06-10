@@ -3,26 +3,30 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 import streamlit as st
+import base64
 
+# DB 파일명
 DB_FILE = "global_app.db"
-CURRENT_USER = "user1"  # 가상 로그인 유저 고정
 
-# --- [1. 데이터베이스 초기화 및 CSV 임포트 로직] ---
+# --- [데이터베이스 초기화 및 스키마 업데이트] ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # 4개 테이블 생성 (제공된 스키마 준수)
+    # 1. User_Table (수발신 날짜 컬럼 추가)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS User_Table (
             P_ID TEXT PRIMARY KEY,
             P_PW TEXT,
             name TEXT,
             language TEXT,
-            country TEXT
+            country TEXT,
+            last_sent_date TEXT,
+            last_received_date TEXT
         )
     """)
     
+    # 2. Diary_Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS Diary_Table (
             D_ID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,6 +39,7 @@ def init_db():
         )
     """)
     
+    # 3. Community_Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS Community_Table (
             T_ID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,227 +51,215 @@ def init_db():
         )
     """)
 
+    # 4. Community_Like_Table (좋아요)
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS Culture_Info_Table (
-            I_ID INTEGER PRIMARY KEY AUTOINCREMENT,
-            targeted TEXT,
-            subject TEXT,
-            I_text TEXT,
-            cautions TEXT
+        CREATE TABLE IF NOT EXISTS Community_Like_Table (
+            L_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+            T_ID INTEGER,
+            P_ID TEXT
         )
     """)
+
+    # 5. Community_Comment_Table (댓글)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Community_Comment_Table (
+            C_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+            T_ID INTEGER,
+            P_ID TEXT,
+            comment_text TEXT,
+            wr_date TEXT
+        )
+    """)
+    
     conn.commit()
-
-    # [스프레드시트에서 내려받은 CSV 파일이 주변에 있다면 자동으로 DB에 밀어넣는 로직]
-    # 파일명 매핑 (가지고 계신 파일명에 맞게 조정 가능)
-    csv_mappings = {
-        "User_Table": "지구촌 협력 앱 DB.xlsx - User_Table.csv",
-        "Diary_Table": "지구촌 협력 앱 DB.xlsx - Diary_Table.csv",
-        "Community_Table": "지구촌 협력 앱 DB.xlsx - Community_Table.csv",
-        "Culture_Info_Table": "지구촌 협력 앱 DB.xlsx - Culture_Info_Table.csv"
-    }
-
-    for table_name, csv_file in csv_mappings.items():
-        # DB가 비어있고 CSV 파일이 존재할 때만 임포트 진행
-        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-        if cursor.fetchone()[0] == 0 and os.path.exists(csv_file):
-            try:
-                df = pd.read_csv(csv_file)
-                # 데이터프레임을 SQLite 테이블에 밀어넣기
-                df.to_sql(table_name, conn, if_exists='append', index=False)
-                st.info(f"💡 {csv_file} 데이터를 성공적으로 DB에 로드했습니다.")
-            except Exception as e:
-                st.error(f"❌ {csv_file} 로드 중 오류 발생: {e}")
-
-    # 기본 테스트 더미 데이터 (CSV 파일이 없을 경우 대비 예외처리용)
-    cursor.execute("SELECT COUNT(*) FROM User_Table")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT OR IGNORE INTO User_Table VALUES ('user1', 'pwd1', '지구인A', 'KO', 'South Korea')")
-        cursor.execute("INSERT OR IGNORE INTO User_Table VALUES ('user2', 'pwd2', 'Smith', 'EN', 'USA')")
-        cursor.execute("INSERT OR IGNORE INTO Diary_Table (S_ID, R_ID, date, O, O_language, translated) VALUES ('user2', NULL, '2026-06-10', 'Hello! This is a letter floating from USA.', 'EN', NULL)")
-        cursor.execute("INSERT OR IGNORE INTO Community_Table (random, title, text, wr_date, s_category) VALUES ('rand', '반갑습니다', '소통광장에 오신 것을 환영합니다.', '2026-06-10 12:30', '자유')")
-        conn.commit()
-
     conn.close()
 
-# 앱 기동 시 DB 초기화 실행
 init_db()
 
+# --- [유틸리티 함수] ---
+def get_db_connection():
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
 
-# --- [2. Streamlit UI 구성] ---
-st.set_page_config(page_title="지구촌 협력 애플리케이션", page_icon="🌍", layout="centered")
-st.title("🌍 지구촌 협력 애플리케이션")
+def encode_pw(pw):
+    return base64.b64encode(pw.encode('utf-8')).decode('utf-8')
 
-# 상단 탭 구성 (바다 vs 광장)
-tab_ocean, tab_plaza = st.tabs(["🌊 표류하는 일기바다", "🕊️ 익명 소통광장"])
+# --- [세션 초기화] ---
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+if "user_info" not in st.session_state:
+    st.session_state.user_info = None
 
-# --- [3. 🌊 표류하는 일기바다 탭 구현] ---
-with tab_ocean:
-    st.subheader("🌊 표류하는 일기바다")
-    st.caption("지구촌 어딘가에서 떠도는 비밀 일기를 건지거나, 당신의 이야기를 바다에 띄워보세요.")
+# ==========================================
+# [로그인 / 회원가입 화면]
+# ==========================================
+if not st.session_state.logged_in:
+    st.markdown("<h1 style='text-align: center;'>🌍 지구촌 일기 우체통</h1>", unsafe_allow_html=True)
     
-    # 기능 분할 (글 쓰기 / 글 건지기)
-    col1, col2 = st.columns(2)
+    auth_tabs = st.tabs(["로그인", "회원가입"])
     
-    with col1:
-        st.write("### ✉️ 내 일기 바다에 던지기")
-        diary_text = st.text_area("이야기 작성", placeholder="지구촌 누군가에게 닿을 이야기를 적어보세요...", key="diary_input", label_visibility="collapsed")
-        if st.button("바다에 던지기", use_container_width=True):
-            if diary_text.strip():
-                conn = sqlite3.connect(DB_FILE)
-                cursor = conn.cursor()
-                date_str = datetime.now().strftime("%Y-%m-%d")
+    with auth_tabs[0]:
+        with st.form("login_form"):
+            st.write("### 서랍 열기")
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                login_id_prefix = st.text_input("아이디", placeholder="아이디 입력", label_visibility="collapsed")
+            with col2:
+                st.markdown("<div style='margin-top: 10px; font-weight: bold;'>@gmail.com</div>", unsafe_allow_html=True)
+            
+            login_pw = st.text_input("비밀번호", type="password", placeholder="비밀번호")
+            submit_login = st.form_submit_button("로그인", use_container_width=True)
+            
+            if submit_login:
+                if not login_id_prefix or not login_pw:
+                    st.error("항목을 모두 입력하세요.")
+                else:
+                    full_id = f"{login_id_prefix}@gmail.com"
+                    conn = get_db_connection()
+                    user = pd.read_sql_query("SELECT * FROM User_Table WHERE P_ID=? AND P_PW=?", conn, params=(full_id, encode_pw(login_pw)))
+                    conn.close()
+                    
+                    if not user.empty:
+                        st.session_state.logged_in = True
+                        st.session_state.user_info = user.iloc[0].to_dict()
+                        st.rerun()
+                    else:
+                        st.error("정보가 일치하지 않습니다.")
+
+    with auth_tabs[1]:
+        with st.form("register_form"):
+            st.write("### 동행인 정보 등록")
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                reg_id_prefix = st.text_input("사용할 아이디", placeholder="아이디 입력", label_visibility="collapsed")
+            with col2:
+                st.markdown("<div style='margin-top: 10px; font-weight: bold;'>@gmail.com</div>", unsafe_allow_html=True)
                 
-                # ★ 자동번역 삭제 요구사항 반영: translated 컬럼에는 None(NULL) 삽입
-                cursor.execute("""
-                    INSERT INTO Diary_Table (S_ID, R_ID, date, O, O_language, translated)
-                    VALUES (?, NULL, ?, ?, 'KO', NULL)
-                """, (CURRENT_USER, date_str, diary_text))
-                conn.commit()
-                conn.close()
-                st.success("편지를 성공적으로 바다에 던졌습니다! 🌊")
-            else:
-                st.warning("내용을 입력해주세요.")
+            reg_pw = st.text_input("비밀번호 (8자 이상)", type="password")
+            reg_name = st.text_input("닉네임")
+            reg_lang = st.selectbox("사용 언어", ["KO", "EN", "JA", "ZH", "FR"])
+            reg_country = st.selectbox("국가", ['Korea', 'USA', 'Japan', 'China', 'United Kingdom', 'France', 'Germany', 'Vietnam'])
+            
+            submit_reg = st.form_submit_button("가입하기", use_container_width=True)
+            
+            if submit_reg:
+                if not reg_id_prefix or not reg_pw or not reg_name:
+                    st.error("빈칸을 모두 채워주세요.")
+                elif len(reg_pw) < 8:
+                    st.error("비밀번호는 8자 이상이어야 합니다.")
+                else:
+                    full_id = f"{reg_id_prefix}@gmail.com"
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT * FROM User_Table WHERE P_ID=?", (full_id,))
+                    if cursor.fetchone():
+                        st.error("이미 존재하는 아이디입니다.")
+                    else:
+                        cursor.execute("INSERT INTO User_Table VALUES (?, ?, ?, ?, ?, '', '')", 
+                                       (full_id, encode_pw(reg_pw), reg_name, reg_lang, reg_country))
+                        conn.commit()
+                        st.success("가입 완료! 로그인 탭에서 접속해주세요.")
+                    conn.close()
 
-    with col2:
-        st.write("### 🛟 타인의 일기 건지기")
-        st.write("바다 속에 표류 중인 익명의 편지를 무작위로 하나 건져올립니다.")
-        
-        if st.button("🎣 편지 건져올리기", use_container_width=True):
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
-            
-            # 내가 쓰지 않았고, 아직 아무도 건지지 않은(R_ID IS NULL) 랜덤 편지 검색
-            cursor.execute("""
-                SELECT D_ID, S_ID, date, O, O_language FROM Diary_Table
-                WHERE S_ID != ? AND R_ID IS NULL
-                ORDER BY RANDOM() LIMIT 1
-            """, (CURRENT_USER,))
-            row = cursor.fetchone()
-            
-            if row:
-                d_id, s_id, date, o_text, o_lang = row
-                # 소유권 이전 (R_ID를 현재 유저로 업데이트)
-                cursor.execute("UPDATE Diary_Table SET R_ID = ? WHERE D_ID = ?", (CURRENT_USER, d_id))
-                conn.commit()
-                
-                # 세션 상태에 저장하여 화면에 고정 표시
-                st.session_state['fished_diary'] = {
-                    "sender": s_id,
-                    "date": date,
-                    "content": o_text,
-                    "lang": o_lang
-                }
-                st.toast("새로운 편지를 건졌습니다!")
-            else:
-                st.session_state['fished_diary'] = None
-                st.info("바다에 떠도는 새로운 편지가 더 이상 없습니다. 🌊")
-            conn.close()
-            
-        # 건진 편지가 세션에 존재할 때 UI 출력
-        if st.session_state.get('fished_diary'):
-            fd = st.session_state['fished_diary']
-            st.info(f"""
-            **📩 건져 올린 편지 원문** ({fd['lang']})  
-            *발신인: {fd['sender']} / 날짜: {fd['date']}* ---
-            "{fd['content']}"
-            
-            ---
-            *이 편지는 당신이 소유권을 획득하여 보관함에 안전하게 저장되었습니다. 🗂️*
-            """)
+else:
+    # ==========================================
+    # [메인 앱 화면 (로그인 성공 후)]
+    # ==========================================
+    user = st.session_state.user_info
+    
+    st.sidebar.markdown(f"**👤 {user['name']}** ({user['country']})")
+    if st.sidebar.button("로그아웃"):
+        st.session_state.logged_in = False
+        st.session_state.user_info = None
+        st.rerun()
 
-    # 히스토리 보관함 역역
-    st.write("---")
-    st.write("### 🗂️ 내 편지 보관함 (히스토리)")
-    
-    hist_tab1, hist_tab2 = st.tabs(["내가 띄운 편지 ✉️", "내가 건진 편지 🛟"])
-    
-    conn = sqlite3.connect(DB_FILE)
-    df_all = pd.read_sql_query("SELECT * FROM Diary_Table", conn)
-    conn.close()
-    
-    with hist_tab1:
-        df_floated = df_all[df_all['S_ID'] == CURRENT_USER].sort_values(by="D_ID", ascending=False)
-        if not df_floated.empty:
-            for _, item in df_floated.iterrows():
-                status = f"➔ 수신자: {item['R_ID']}" if item['R_ID'] else "➔ 바다 표류 중 🌊"
-                with st.expander(f"📅 {item['date']} | {status}"):
-                    st.write(item['O'])
-        else:
-            st.caption("바다에 띄운 편지가 없습니다.")
-            
-    with hist_tab2:
-        df_fished = df_all[df_all['R_ID'] == CURRENT_USER].sort_values(by="D_ID", ascending=False)
-        if not df_fished.empty:
-            for _, item in df_fished.iterrows():
-                with st.expander(f"📅 {item['date']} | 보낸사람: {item['S_ID']}"):
-                    st.write(f"**원문 ({item['O_language']}):**")
-                    st.write(item['O'])
-        else:
-            st.caption("건져 올린 편지가 없습니다.")
+    tab_ocean, tab_plaza = st.tabs(["🌊 표류하는 일기바다", "🕊️ 익명 소통광장"])
 
-
-# --- [4. 🕊️ 익명 소통광장 탭 구현] ---
-with tab_plaza:
-    st.subheader("🕊️ 익명 소통광장")
-    st.caption("전 세계 사람들과 익명으로 트위터/스레드 스타일의 자유로운 이야기를 나눠보세요.")
-    
-    # 1. 새 글 작성 영역
-    with st.expander("✒️ 새로운 생각 나누기 (글쓰기)", expanded=False):
-        col_cat, col_title = st.columns([1, 2])
-        with col_cat:
-            p_category = st.selectbox("카테고리", ["자유", "문화", "질문"])
-        with col_title:
-            p_title = st.text_input("제목 (선택)", placeholder="무제")
-            
-        p_text = st.text_area("내용", placeholder="무슨 일이 일어나고 있나요? 자유롭게 적어보세요.")
-        
-        if st.button("광장에 올리기", use_container_width=True):
-            if p_text.strip():
-                conn = sqlite3.connect(DB_FILE)
-                cursor = conn.cursor()
-                wr_date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-                final_title = p_title if p_title.strip() else "무제"
-                
-                cursor.execute("""
-                    INSERT INTO Community_Table (random, title, text, wr_date, s_category)
-                    VALUES ('rand_user', ?, ?, ?, ?)
-                """, (final_title, p_text, wr_date_str, p_category))
-                conn.commit()
-                conn.close()
-                st.success("글이 소통광장에 즉시 등록되었습니다!")
-                st.rerun()  # 등록 즉시 피드 새로고침
-            else:
-                st.warning("내용을 입력해주세요.")
-                
-    st.write("---")
-    
-    # 2. 카테고리 필터링 조회 영역
-    selected_filter = st.radio("카테고리 필터", ["전체", "자유", "문화", "질문"], horizontal=True)
-    
-    conn = sqlite3.connect(DB_FILE)
-    if selected_filter == "전체":
-        df_posts = pd.read_sql_query("SELECT * FROM Community_Table ORDER BY T_ID DESC", conn)
-    else:
-        df_posts = pd.read_sql_query("SELECT * FROM Community_Table WHERE s_category = ? ORDER BY T_ID DESC", conn, params=(selected_filter,))
-    conn.close()
-    
-    # 피드 레이아웃 스타일 렌더링
-    if not df_posts.empty:
-        for _, post in df_posts.iterrows():
-            st.markdown(f"""
-            <div style="background-color: #f9f9f9; padding: 15px; border-radius: 12px; margin-bottom: 12px; border: 1px solid #eee;">
-                <span style="font-size: 11px; background-color: #e3f2fd; color: #0d47a1; padding: 2px 8px; border-radius: 10px; font-weight: bold; float: right;">
-                    {post['s_category']}
-                </span>
-                <span style="font-weight: bold; font-size: 14px; color: #333;">👤 익명의 누군가</span> 
-                <span style="font-size: 11px; color: #aaa; margin-left: 5px;">@anonymous · {post['wr_date']}</span>
-                <h4 style="margin: 8px 0 4px 0; color: #111; font-size: 15px;">{post['title']}</h4>
-                <p style="font-size: 13px; color: #444; line-height: 1.5; margin: 0;">{post['text']}</p>
-                <div style="margin-top: 10px; font-size: 12px; color: #888;">
-                    ❤️ 12 &nbsp;&nbsp; 💬 4 &nbsp;&nbsp; 🔁 공유
-                </div>
+    # ------------------------------------------
+    # 1. 🌊 표류하는 일기바다
+    # ------------------------------------------
+    with tab_ocean:
+        # 바다 테마 CSS 적용 및 이모티콘 애니메이션
+        st.markdown("""
+        <style>
+        .ocean-bg {
+            background: linear-gradient(180deg, #87CEEB 0%, #1E90FF 100%);
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            min-height: 250px;
+            position: relative;
+            overflow: hidden;
+            box-shadow: inset 0 0 20px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .emoji-float {
+            font-size: 2.5rem;
+            display: inline-block;
+            margin: 0 15px;
+            animation: float 3s ease-in-out infinite;
+        }
+        @keyframes float {
+            0% { transform: translateY(0px) rotate(0deg); }
+            50% { transform: translateY(-15px) rotate(10deg); }
+            100% { transform: translateY(0px) rotate(0deg); }
+        }
+        </style>
+        <div class="ocean-bg">
+            <h3 style="color: white; text-shadow: 1px 1px 2px rgba(0,0,0,0.5);">밀려오는 일기 바다</h3>
+            <p style="color: #f0f0f0;">바다에 떠도는 편지를 건져보세요.</p>
+            <div style="margin-top: 30px;">
+                <span class="emoji-float">🛟</span>
+                <span class="emoji-float" style="animation-delay: 0.5s;">🐠</span>
+                <span class="emoji-float" style="animation-delay: 1s;">📜</span>
+                <span class="emoji-float" style="animation-delay: 1.5s;">🦑</span>
             </div>
-            """, unsafe_allow_html=True)
-    else:
-        st.caption("광장에 등록된 이야기가 아직 없습니다.")
+        </div>
+        """, unsafe_allow_html=True)
+
+        col_action1, col_action2 = st.columns(2)
+        
+        # 글 건지기 기능
+        with col_action1:
+            if st.button("🎣 바다에서 편지 건지기", use_container_width=True):
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                
+                # 수신 제한 체크
+                if user['last_received_date'] == today_str:
+                    st.warning("오늘은 이미 편지를 건졌습니다. 내일 다시 시도해주세요!")
+                else:
+                    cursor.execute("""
+                        SELECT D_ID, S_ID, date, O, O_language FROM Diary_Table
+                        WHERE S_ID != ? AND (R_ID IS NULL OR R_ID = '')
+                        ORDER BY RANDOM() LIMIT 1
+                    """, (user['P_ID'],))
+                    row = cursor.fetchone()
+                    
+                    if row:
+                        d_id, s_id, d_date, o_text, o_lang = row
+                        cursor.execute("UPDATE Diary_Table SET R_ID = ? WHERE D_ID = ?", (user['P_ID'], d_id))
+                        cursor.execute("UPDATE User_Table SET last_received_date = ? WHERE P_ID = ?", (today_str, user['P_ID']))
+                        conn.commit()
+                        st.session_state.user_info['last_received_date'] = today_str
+                        
+                        st.success("🎉 새로운 편지를 건져 소유권을 획득했습니다! (보관함 확인)")
+                        st.info(f"**원문 ({o_lang})**\n\n{o_text}")
+                    else:
+                        st.info("바다에 건질 편지가 없습니다. (누군가 띄워주길 기다리세요 🌊)")
+                conn.close()
+
+        # 하단 메뉴 (편지 띄우기 & 보관함)을 Popover(버튼 안으로 숨기기)로 구현
+        with col_action2:
+            with st.popover("✉️ 새 편지 띄우기", use_container_width=True):
+                st.write("**바다에 내 이야기 던지기 (최대 500자)**")
+                diary_content = st.text_area("내용", max_chars=500, label_visibility="collapsed")
+                
+                if st.button("✈️ 비행기 날려보내기", use_container_width=True):
+                    today_str = datetime.now().strftime("%Y-%m-%d")
+                    if not diary_content.strip():
+                        st.error("내용을 작성해주세요.")
+                    elif user['last_sent_date'] == today_str:
+                        st.error("일기는 하루에 1개만 발송할 수 있습니다.")
+                    else:
+                        conn = get
